@@ -64,14 +64,35 @@ public partial class Form1 : Form
     private bool _bopStageStarted = false;
 
     // Estado de endpoints Protheus
-    private bool _healthActivo = true;
-    private bool _protheusActivo = true;
+    private EstadoEndpoint _healthEstado   = EstadoEndpoint.SinDatos;
+    private EstadoEndpoint _protheusEstado = EstadoEndpoint.SinDatos;
 
     // Downtime tracking: cuándo se cayó y tiempo total acumulado en sesión
     private DateTime? _healthCaidoDesde;
     private DateTime? _protheusCaidoDesde;
     private TimeSpan _healthTiempoTotal = TimeSpan.Zero;
     private TimeSpan _protheusTiempoTotal = TimeSpan.Zero;
+
+    // Supresión de falso "Inactivo" durante exportación de BOPs (los 500/timeout puntuales
+    // durante la ráfaga de exportación suelen resolverse con reintento y no son una caída real)
+    private bool _exportandoBopsAnterior = false;
+    private DateTime? _exportBopsFinalizadoEn;
+    private static readonly TimeSpan GraciaPostExportacion = TimeSpan.FromSeconds(60);
+
+    // Conectividad con el servidor de red (\\192.168.0.47\...)
+    private bool _servidorAlcanzable = true;
+    private DateTime? _sinConexionDesde;
+    private static readonly TimeSpan UmbralAvisoSinConexion = TimeSpan.FromSeconds(10);
+
+    // Error al leer appsettings.json (se avisa una vez, no interrumpe el arranque)
+    private string? _configLoadError;
+
+    // Último error inesperado del monitor (se muestra en el banner superior en vez de pisar otras labels)
+    private string? _monitorError;
+
+    // Log aparte con historial de caídas/recuperaciones de HEALTH y Endpoints (Protheus)
+    private static readonly string DowntimeLogPath = Path.Combine(AppContext.BaseDirectory, "ProtheusDowntime.log");
+    private static readonly object DowntimeLogLock = new();
 
     // Contexto último SG2 para interpretar Body (ej. alias SH1)
     private string? _sg2LastCtxProd;
@@ -97,6 +118,8 @@ public partial class Form1 : Form
     // Errores BOP
     private int _bopErrorCount = 0;
     private string? _lastBopError;
+
+    private List<string> _colaMbom = new();
 
     // =======================
     // Colores UI
@@ -262,115 +285,158 @@ public partial class Form1 : Form
 
     private readonly System.Windows.Forms.Timer _timer;
 
+    private readonly ToolTip _toolTip = new();
+
     public Form1()
     {
         Text    = "Descar Conector — Monitor";
-        Width   = 980;
-        Height  = 660;
+        Width   = 1000;
+        Height  = 822;
         BackColor     = ClrBg;
         Font          = new Font("Segoe UI", 9f);
         DoubleBuffered = true;
+        FormBorderStyle = FormBorderStyle.FixedSingle;
+        MaximizeBox     = false;
+        StartPosition   = FormStartPosition.CenterScreen;
 
-        const int x = 16, w = 944;
+        const int x = 16, w = 952, pad = 14, gap = 10;
         int y = 12;
+
+        // ─────────────────────────────────────────────
+        // BANNER DE ESTADO (sin conexión / error del monitor)
+        // ─────────────────────────────────────────────
+        var lblBanner = new Label
+        {
+            Left = x, Top = y, Width = w, Height = 26, Name = "lblBanner",
+            TextAlign = ContentAlignment.MiddleCenter, AutoSize = false,
+            Font = new Font("Segoe UI", 9f, FontStyle.Bold),
+            Visible = false
+        };
+        Controls.Add(lblBanner);
+        y += 26 + gap;
 
         // ─────────────────────────────────────────────
         // SECCIÓN MBOM
         // ─────────────────────────────────────────────
-        Controls.Add(MakeSectionHeader("MBOM", x, y, w));       y += 22;
+        {
+            int cy = pad;
+            var card = MakeCard(x, y, w, 120);
+            card.Controls.Add(MakeSectionHeader("MBOM", pad, cy, w - pad * 2)); cy += 22;
 
-        var lblMbomProg = MakeLabel("lblMbomProg", x, y, w);    y += 18;
-        var lblMbomSub  = MakeLabel("lblMbomSub",  x, y, w, ClrTextSec); y += 20;
+            var lblMbomProg = MakeLabel("lblMbomProg", pad, cy, w - pad * 2); cy += 18;
+            var lblMbomSub  = MakeLabel("lblMbomSub",  pad, cy, w - pad * 2, ClrTextSec); cy += 20;
 
-        var lblTagSb1 = MakeTag("SB1", x, y + 1);
-        var pbSb1 = new FlatProgressBar { Left = x + 42, Top = y, Width = w - 42, Height = 14, Name = "pbSb1", BarColor = ClrBlue };
-        y += 19;
+            var lblTagSb1 = MakeTag("SB1", pad, cy + 1);
+            var pbSb1 = new FlatProgressBar { Left = pad + 42, Top = cy, Width = w - pad * 2 - 42, Height = 14, Name = "pbSb1", BarColor = ClrBlue };
+            cy += 19;
 
-        var lblTagSg1 = MakeTag("SG1", x, y + 1);
-        var pbSg1 = new FlatProgressBar { Left = x + 42, Top = y, Width = w - 42, Height = 14, Name = "pbSg1", BarColor = ClrTeal };
-        y += 19;
+            var lblTagSg1 = MakeTag("SG1", pad, cy + 1);
+            var pbSg1 = new FlatProgressBar { Left = pad + 42, Top = cy, Width = w - pad * 2 - 42, Height = 14, Name = "pbSg1", BarColor = ClrTeal };
 
-        Controls.Add(MakeSeparator(x, y + 4, w)); y += 14;
+            card.Controls.AddRange(new Control[] { lblMbomProg, lblMbomSub, lblTagSb1, pbSb1, lblTagSg1, pbSg1 });
+            y += 120 + gap;
+        }
 
         // ─────────────────────────────────────────────
         // SECCIÓN BOP
         // ─────────────────────────────────────────────
-        Controls.Add(MakeSectionHeader("BOP", x, y, w));        y += 22;
+        {
+            int cy = pad;
+            var card = MakeCard(x, y, w, 82);
+            card.Controls.Add(MakeSectionHeader("BOP", pad, cy, w - pad * 2)); cy += 22;
 
-        var lblBopProg = MakeLabel("lblBopProg", x, y, w);      y += 18;
+            var lblBopProg = MakeLabel("lblBopProg", pad, cy, w - pad * 2); cy += 18;
 
-        var lblTagBop = MakeTag("BOP", x, y + 1);
-        var pbBop = new FlatProgressBar { Left = x + 42, Top = y, Width = w - 42, Height = 14, Name = "pbBop", BarColor = ClrOrange };
-        y += 19;
+            var lblTagBop = MakeTag("BOP", pad, cy + 1);
+            var pbBop = new FlatProgressBar { Left = pad + 42, Top = cy, Width = w - pad * 2 - 42, Height = 14, Name = "pbBop", BarColor = ClrOrange };
 
-        Controls.Add(MakeSeparator(x, y + 4, w)); y += 14;
+            card.Controls.AddRange(new Control[] { lblBopProg, lblTagBop, pbBop });
+            y += 82 + gap;
+        }
 
         // ─────────────────────────────────────────────
         // CONTEXTO
         // ─────────────────────────────────────────────
-        var lblXml      = MakeLabel("lblXml",      x, y, w);            y += 18;
-        var lblMbom     = MakeLabel("lblMbom",     x, y, w);            y += 18;
-        var lblMbomPath = MakeLabel("lblMbomPath", x, y, w - 110, ClrTextSec);
-        var btnOpen = new Button
         {
-            Left = x + w - 98, Top = y - 1, Width = 90, Height = 24,
-            Name = "btnOpen", Text = "Abrir",
-            FlatStyle = FlatStyle.Flat,
-            BackColor = ClrCard, ForeColor = ClrBlue,
-            Cursor = Cursors.Hand
-        };
-        btnOpen.FlatAppearance.BorderColor = ClrBlue;
-        btnOpen.Click += (_, __) => AbrirCarpetaMbom();
-        y += 26;
+            int cy = pad;
+            var card = MakeCard(x, y, w, 106);
+            card.Controls.Add(MakeSectionHeader("Contexto", pad, cy, w - pad * 2)); cy += 22;
 
-        Controls.Add(MakeSeparator(x, y + 2, w)); y += 12;
+            var lblXml      = MakeLabel("lblXml",      pad, cy, w - pad * 2);            cy += 18;
+            var lblMbom     = MakeLabel("lblMbom",     pad, cy, w - pad * 2);            cy += 18;
+            var lblMbomPath = MakeLabel("lblMbomPath", pad, cy, w - pad * 2 - 110, ClrTextSec);
+            var btnOpen = new Button
+            {
+                Left = w - pad - 98, Top = cy - 1, Width = 90, Height = 24,
+                Name = "btnOpen", Text = "Abrir",
+                FlatStyle = FlatStyle.Flat,
+                BackColor = ClrCard, ForeColor = ClrBlue,
+                Cursor = Cursors.Hand
+            };
+            btnOpen.FlatAppearance.BorderColor = ClrBlue;
+            btnOpen.Click += (_, __) => AbrirCarpetaMbom();
+
+            card.Controls.AddRange(new Control[] { lblXml, lblMbom, lblMbomPath, btnOpen });
+            y += 106 + gap;
+        }
 
         // ─────────────────────────────────────────────
         // COLA DE MBOM PENDIENTES
         // ─────────────────────────────────────────────
-        var lblColaTitle = new Label
         {
-            Left = x, Top = y, Width = w, Name = "lblColaTitle",
-            Text = "MBOM en cola",
-            Font = new Font("Segoe UI", 9f, FontStyle.Bold),
-            ForeColor = ClrAccent, AutoSize = false
-        };
-        y += 22;
+            int cy = pad;
+            var card = MakeCard(x, y, w, 122);
+            var lblColaTitle = new Label
+            {
+                Left = pad, Top = cy, Width = w - pad * 2, Name = "lblColaTitle",
+                Text = "MBOM en cola",
+                Font = new Font("Segoe UI", 9f, FontStyle.Bold),
+                ForeColor = ClrAccent, AutoSize = false
+            };
+            cy += 22;
 
-        // Card blanca con borde sutil
-        var pnlColaOuter = new Panel { Left = x, Top = y, Width = w, Height = 82, BackColor = ClrSep };
-        var pnlColaInner = new Panel { Left = 1, Top = 1, Width = w - 2, Height = 80, BackColor = ClrCard };
-        var lblCola = new Label
-        {
-            Left = 8, Top = 5, Width = w - 18, Height = 70,
-            Name = "lblCola", AutoSize = false, ForeColor = ClrTextPrim
-        };
-        pnlColaInner.Controls.Add(lblCola);
-        pnlColaOuter.Controls.Add(pnlColaInner);
-        y += 88;
+            var lbCola = new ListBox
+            {
+                Left = pad, Top = cy, Width = w - pad * 2, Height = 122 - cy - pad,
+                Name = "lbCola",
+                BorderStyle = BorderStyle.None,
+                BackColor = ClrCard,
+                ForeColor = ClrTextPrim,
+                SelectionMode = SelectionMode.None,
+                HorizontalScrollbar = false,
+                IntegralHeight = false,
+            };
 
-        Controls.Add(MakeSeparator(x, y + 2, w)); y += 12;
+            card.Controls.AddRange(new Control[] { lblColaTitle, lbCola });
+            y += 122 + gap;
+        }
 
         // ─────────────────────────────────────────────
         // ÚLTIMO ESTADO PROTHEUS
         // ─────────────────────────────────────────────
-        Controls.Add(MakeSectionHeader("Último estado Protheus", x, y, w)); y += 22;
-
-        var lblSb1 = MakeLabel("lblProSb1", x, y, w); y += 20;
-        var lblSg1 = MakeLabel("lblProSg1", x, y, w); y += 20;
-        var lblSg2 = MakeLabel("lblProSg2", x, y, w); y += 20;
-        var lblBopErrors = new Label
         {
-            Left = x, Top = y, Width = w, Height = 18, Name = "lblBopErrors",
-            AutoSize = false, AutoEllipsis = true, ForeColor = ClrTextSec
-        };
-        y += 22;
+            int cy = pad;
+            var card = MakeCard(x, y, w, 124);
+            card.Controls.Add(MakeSectionHeader("Último estado Protheus", pad, cy, w - pad * 2)); cy += 22;
 
-        Controls.Add(MakeSeparator(x, y + 2, w)); y += 12;
+            var lblSb1 = MakeLabel("lblProSb1", pad, cy, w - pad * 2); cy += 20;
+            var lblSg1 = MakeLabel("lblProSg1", pad, cy, w - pad * 2); cy += 20;
+            var lblSg2 = MakeLabel("lblProSg2", pad, cy, w - pad * 2); cy += 20;
+            var lblBopErrors = new Label
+            {
+                Left = pad, Top = cy, Width = w - pad * 2, Height = 18, Name = "lblBopErrors",
+                AutoSize = false, AutoEllipsis = true, ForeColor = ClrTextSec
+            };
+
+            card.Controls.AddRange(new Control[] { lblSb1, lblSg1, lblSg2, lblBopErrors });
+            y += 124 + gap;
+        }
 
         // ─────────────────────────────────────────────
-        // PIE: ACTUALIZACIÓN + ENDPOINTS
+        // PIE: ACTUALIZACIÓN + ENDPOINTS + VERSIÓN
         // ─────────────────────────────────────────────
+        Controls.Add(MakeSeparator(x, y, w)); y += 10;
+
         var lblUpd = MakeLabel("lblUpd", x, y, w, ClrTextSec); y += 22;
 
         var lblEstadoTitulo = new Label
@@ -390,6 +456,13 @@ public partial class Form1 : Form
             TextAlign = ContentAlignment.MiddleCenter, AutoSize = false,
             Font = new Font("Segoe UI", 9f, FontStyle.Bold)
         };
+        var lblBopExportando = new Label
+        {
+            Left = x + 542, Top = y, Width = w - 542, Height = 26, Name = "lblBopExportando",
+            TextAlign = ContentAlignment.MiddleCenter, AutoSize = false,
+            Font = new Font("Segoe UI", 9f, FontStyle.Bold),
+            Visible = false
+        };
         y += 32;
 
         var lblHealthDowntime = new Label
@@ -403,18 +476,29 @@ public partial class Form1 : Form
             Left = x, Top = y, Width = w, Height = 16, Name = "lblProtheusDowntime",
             AutoSize = false, ForeColor = Color.DimGray
         };
+        y += 20;
+
+        var version = typeof(Form1).Assembly.GetName().Version;
+        var versionText = version != null ? $"{version.Major}.{version.Minor}.{version.Build}" : "1.0.0";
+        var lblVersion = new Label
+        {
+            Left = x, Top = y, Width = w, Height = 16, Name = "lblVersion",
+            Text = $"Descar Conector — Monitor  ·  v{versionText}",
+            TextAlign = ContentAlignment.MiddleRight,
+            ForeColor = ClrTextSec, AutoSize = false
+        };
 
         Controls.AddRange(new Control[]
         {
-            lblMbomProg, lblMbomSub, lblTagSb1, pbSb1, lblTagSg1, pbSg1,
-            lblBopProg, lblTagBop, pbBop,
-            lblXml, lblMbom, lblMbomPath, btnOpen,
-            lblColaTitle, pnlColaOuter,
-            lblSb1, lblSg1, lblSg2, lblBopErrors,
             lblUpd,
-            lblEstadoTitulo, lblHealthStatus, lblProtheusStatus,
-            lblHealthDowntime, lblProtheusDowntime
+            lblEstadoTitulo, lblHealthStatus, lblProtheusStatus, lblBopExportando,
+            lblHealthDowntime, lblProtheusDowntime, lblVersion
         });
+
+        _toolTip.SetToolTip(lblHealthStatus,
+            "Gris = todavía no llegó ningún dato de este endpoint en la sesión actual.\nVerde = responde OK.  Rojo = no responde.");
+        _toolTip.SetToolTip(lblProtheusStatus,
+            "Gris = todavía no llegó ningún dato de este endpoint en la sesión actual.\nVerde = responde OK.  Rojo = no responde.");
 
         LoadConfig();
 
@@ -453,6 +537,17 @@ public partial class Form1 : Form
     private static Panel MakeSeparator(int x, int y, int w)
         => new Panel { Left = x, Top = y, Width = w, Height = 1, BackColor = ClrSep };
 
+    // Tarjeta blanca con borde sutil; devuelve el panel interno donde se agregan los controles
+    // (usar coordenadas relativas al panel interno, no al form).
+    private Panel MakeCard(int x, int y, int w, int h)
+    {
+        var outer = new Panel { Left = x, Top = y, Width = w, Height = h, BackColor = ClrSep };
+        var inner = new Panel { Left = 1, Top = 1, Width = w - 2, Height = h - 2, BackColor = ClrCard };
+        outer.Controls.Add(inner);
+        Controls.Add(outer);
+        return inner;
+    }
+
     private void LoadConfig()
     {
         var configPath = Path.Combine(AppContext.BaseDirectory, "appsettings.json");
@@ -477,7 +572,10 @@ public partial class Form1 : Form
                 }
             }
         }
-        catch { }
+        catch (Exception ex)
+        {
+            _configLoadError = $"Error leyendo appsettings.json ({ex.Message}) — usando valores por defecto";
+        }
     }
 
     private string TranslatePath(string path)
@@ -490,20 +588,32 @@ public partial class Form1 : Form
 
     private void AbrirCarpetaMbom()
     {
+        if (string.IsNullOrWhiteSpace(_status.MbomFolderPath))
+        {
+            MessageBox.Show(this, "Todavía no se detectó ninguna carpeta M-BOM en el log.",
+                "Descar Conector — Monitor", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            return;
+        }
+
+        if (!Directory.Exists(_status.MbomFolderPath))
+        {
+            MessageBox.Show(this, $"No se pudo acceder a la carpeta:\n{_status.MbomFolderPath}\n\nVerificá la conexión de red.",
+                "Descar Conector — Monitor", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            return;
+        }
+
         try
         {
-            if (string.IsNullOrWhiteSpace(_status.MbomFolderPath) || !Directory.Exists(_status.MbomFolderPath))
-                return;
-
             Process.Start(new ProcessStartInfo
             {
                 FileName = _status.MbomFolderPath,
                 UseShellExecute = true
             });
         }
-        catch
+        catch (Exception ex)
         {
-            // opcional: MessageBox
+            MessageBox.Show(this, $"No se pudo abrir la carpeta:\n{ex.Message}",
+                "Descar Conector — Monitor", MessageBoxButtons.OK, MessageBoxIcon.Error);
         }
     }
 
@@ -517,26 +627,51 @@ public partial class Form1 : Form
         {
             await System.Threading.Tasks.Task.Run(() =>
             {
+                ActualizarConexionServidor();
                 LeerNuevasLineasServicioYParsear();
                 LeerNuevasLineasScriptPrincipalYParsear();
                 LeerNuevasLineasScriptJsonYParsear();
                 ActualizarProgresoBopFallbackPorCarpetas();
                 ActualizarColaMbom();
             });
+            _monitorError = null;
             PintarUI();
         }
         catch (Exception ex)
         {
-            var lbl = Controls.Find("lblProSb1", true).FirstOrDefault() as Label;
-            if (lbl != null)
-            {
-                lbl.ForeColor = Color.DarkRed;
-                lbl.Text = $"SB1: ERROR monitor -> {ex.Message}";
-            }
+            _monitorError = $"Error en el monitor: {ex.Message}";
+            PintarBanner();
         }
         finally
         {
             _tickRunning = false;
+        }
+    }
+
+    // Verifica si el share de red del servidor (\\192.168.0.47\...) responde.
+    // No confundir con "el log todavía no existe": esto chequea la RAÍZ del share.
+    private void ActualizarConexionServidor()
+    {
+        bool alcanzable;
+        try
+        {
+            var root = Path.GetPathRoot(_serviceLogPath);
+            alcanzable = string.IsNullOrWhiteSpace(root) || Directory.Exists(root);
+        }
+        catch
+        {
+            alcanzable = false;
+        }
+
+        if (alcanzable)
+        {
+            _servidorAlcanzable = true;
+            _sinConexionDesde = null;
+        }
+        else
+        {
+            _sinConexionDesde ??= DateTime.Now;
+            _servidorAlcanzable = false;
         }
     }
 
@@ -581,7 +716,12 @@ public partial class Form1 : Form
         using var fs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
         if (fs.Length < _posService) _posService = 0;
 
-        const long maxInitialRead = 200 * 1024; // 200 KB
+        // Primera carga: escanear todo el archivo para encontrar el último "Estructura creada:"
+        // y establecer el contexto de carpeta/MBOM aunque sea antiguo.
+        if (_posService == 0 && string.IsNullOrWhiteSpace(_status.MbomFolderPath))
+            BuscarContextoInicial(fs);
+
+        const long maxInitialRead = 5 * 1024 * 1024; // 5 MB
         if (_posService == 0 && fs.Length > maxInitialRead)
             _posService = fs.Length - maxInitialRead;
 
@@ -595,6 +735,21 @@ public partial class Form1 : Form
         }
 
         _posService = fs.Position;
+    }
+
+    private void BuscarContextoInicial(FileStream fs)
+    {
+        fs.Position = 0;
+        string? ultimaEstructura = null;
+        using var sr = new StreamReader(fs, System.Text.Encoding.UTF8, true, 65536, leaveOpen: true);
+        string? line;
+        while ((line = sr.ReadLine()) != null)
+        {
+            if (RxEstructura.IsMatch(line))
+                ultimaEstructura = line;
+        }
+        if (ultimaEstructura != null)
+            ParseLineServicio(ultimaEstructura);
     }
 
     private void ParseLineServicio(string line)
@@ -693,11 +848,14 @@ public partial class Form1 : Form
             _status.MbomDone = true;
         }
 
-        // Detección de estado de endpoints
-        if (RxHealthError.IsMatch(line) && _healthActivo)
-        { _healthActivo = false; _healthCaidoDesde = DateTime.Now; }
-        if ((RxInternalServerError.IsMatch(line) || RxHttpTimeout.IsMatch(line)) && _protheusActivo)
-        { _protheusActivo = false; _protheusCaidoDesde = DateTime.Now; }
+        // Solo marcar inactivo con líneas recientes; evita rojo falso al releer logs históricos
+        var lineDtSvc = ParseLineDt(line);
+        var esRecienteSvc = (DateTime.Now - lineDtSvc).TotalMinutes < 3;
+
+        if (esRecienteSvc && RxHealthError.IsMatch(line) && _healthEstado != EstadoEndpoint.Inactivo)
+            MarcarHealthInactivo();
+        if (esRecienteSvc && (RxInternalServerError.IsMatch(line) || RxHttpTimeout.IsMatch(line)) && _protheusEstado != EstadoEndpoint.Inactivo)
+            MarcarProtheusInactivo();
 
         // --- NUEVO: Protheus desde ConectorService.log (prefijo [Web Service.exe])
         ParseLineServicio_Protheus(line);
@@ -828,27 +986,35 @@ public partial class Form1 : Form
         using var fs = new FileStream(_scriptPrincipalLogPath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
         if (fs.Length < _posPrincipal) _posPrincipal = 0;
 
+        // En la primera lectura del log no marcamos endpoints como inactivos:
+        // evita falsos rojos al releer el historial completo al reabrir la app.
+        bool esLecturaInicial = _posPrincipal == 0;
+
         fs.Position = _posPrincipal;
         using var sr = new StreamReader(fs);
 
         string? line;
         while ((line = sr.ReadLine()) != null)
         {
-            // Ignorar JSON multilinea sin timestamp
             if (!RxPrincipalTimestamp.IsMatch(line))
                 continue;
 
-            ParseLineScriptPrincipal(line);
+            ParseLineScriptPrincipal(line, esLecturaInicial);
         }
 
         _posPrincipal = fs.Position;
     }
 
-    private void ParseLineScriptPrincipal(string line)
+    private void ParseLineScriptPrincipal(string line, bool esLecturaInicial = false)
     {
-        // Detección de estado de endpoints
-        if ((RxInternalServerError.IsMatch(line) || RxHttpTimeout.IsMatch(line)) && _protheusActivo)
-        { _protheusActivo = false; _protheusCaidoDesde = DateTime.Now; }
+        // Solo marcar inactivo en lecturas incrementales (no al releer el historial al abrir)
+        if (!esLecturaInicial)
+        {
+            var lineDtPrincipal = ParseLineDt(line);
+            if ((DateTime.Now - lineDtPrincipal).TotalMinutes < 3
+                && (RxInternalServerError.IsMatch(line) || RxHttpTimeout.IsMatch(line)) && _protheusEstado != EstadoEndpoint.Inactivo)
+                MarcarProtheusInactivo();
+        }
 
         // Detección de errores BOP
         if (RxBopError.IsMatch(line))
@@ -880,6 +1046,15 @@ public partial class Form1 : Form
         var mBopAct = RxBopActual.Match(line);
         if (mBopAct.Success)
         {
+            if (!_bopStageStarted)
+            {
+                // Al entrar en fase BOP resetear estado de endpoints para no arrastrar
+                // downtimes o estados del MBOM previo mientras el log aún no existe
+                _healthEstado        = EstadoEndpoint.SinDatos;
+                _protheusEstado      = EstadoEndpoint.SinDatos;
+                _healthCaidoDesde    = null;
+                _protheusCaidoDesde  = null;
+            }
             _bopStageStarted = true;
 
             var total = int.Parse(mBopAct.Groups["total"].Value);
@@ -1213,6 +1388,8 @@ public partial class Form1 : Form
         using var fs = new FileStream(_scriptJsonLogPath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
         if (fs.Length < _posJson) _posJson = 0;
 
+        bool esLecturaInicialJson = _posJson == 0;
+
         fs.Position = _posJson;
         using var sr = new StreamReader(fs);
 
@@ -1222,11 +1399,16 @@ public partial class Form1 : Form
             if (!RxPrincipalTimestamp.IsMatch(line))
                 continue;
 
-            // Detección de estado de endpoints también en JSON log
-            if (RxHealthError.IsMatch(line) && _healthActivo)
-            { _healthActivo = false; _healthCaidoDesde = DateTime.Now; }
-            if ((RxInternalServerError.IsMatch(line) || RxHttpTimeout.IsMatch(line)) && _protheusActivo)
-            { _protheusActivo = false; _protheusCaidoDesde = DateTime.Now; }
+            // Solo marcar inactivo en lecturas incrementales
+            if (!esLecturaInicialJson)
+            {
+                var lineDtJson = ParseLineDt(line);
+                var esRecienteJson = (DateTime.Now - lineDtJson).TotalMinutes < 3;
+                if (esRecienteJson && RxHealthError.IsMatch(line) && _healthEstado != EstadoEndpoint.Inactivo)
+                    MarcarHealthInactivo();
+                if (esRecienteJson && (RxInternalServerError.IsMatch(line) || RxHttpTimeout.IsMatch(line)) && _protheusEstado != EstadoEndpoint.Inactivo)
+                    MarcarProtheusInactivo();
+            }
 
             var m = RxJsonResp.Match(line);
             if (!m.Success) continue;
@@ -1239,19 +1421,23 @@ public partial class Form1 : Form
             if (code == 200 || code == 201)
             {
                 var recoveryDt = DateTime.Now;
-                if (!_healthActivo && _healthCaidoDesde.HasValue)
+                if (_healthEstado == EstadoEndpoint.Inactivo && _healthCaidoDesde.HasValue)
                 {
-                    _healthTiempoTotal += recoveryDt - _healthCaidoDesde.Value;
+                    var duracion = recoveryDt - _healthCaidoDesde.Value;
+                    _healthTiempoTotal += duracion;
                     _healthCaidoDesde = null;
+                    LogDowntimeEvento("HEALTH", $"RECUPERADO (caído {FmtDowntime(duracion)})");
                 }
-                _healthActivo = true;
+                _healthEstado = EstadoEndpoint.Activo;
 
-                if (!_protheusActivo && _protheusCaidoDesde.HasValue)
+                if (_protheusEstado == EstadoEndpoint.Inactivo && _protheusCaidoDesde.HasValue)
                 {
-                    _protheusTiempoTotal += recoveryDt - _protheusCaidoDesde.Value;
+                    var duracion = recoveryDt - _protheusCaidoDesde.Value;
+                    _protheusTiempoTotal += duracion;
                     _protheusCaidoDesde = null;
+                    LogDowntimeEvento("Endpoints", $"RECUPERADO (caído {FmtDowntime(duracion)})");
                 }
-                _protheusActivo = true;
+                _protheusEstado = EstadoEndpoint.Activo;
             }
 
             // Progreso MBOM SB1: sólo códigos del set esperado MBOM
@@ -1274,32 +1460,18 @@ public partial class Form1 : Form
     // ==========================================================
     private void ActualizarColaMbom()
     {
-        var lblCola      = Controls.Find("lblCola",      true).FirstOrDefault() as Label;
-        var lblColaTitle = Controls.Find("lblColaTitle", true).FirstOrDefault() as Label;
-        if (lblCola == null) return;
-
         if (!Directory.Exists(_claimedFolderPath))
         {
-            lblCola.Text = "(carpeta no encontrada)";
-            if (lblColaTitle != null) lblColaTitle.Text = "MBOM en cola";
+            _colaMbom = new List<string>();
             return;
         }
 
-        var archivos = Directory.GetDirectories(_claimedFolderPath)
+        _colaMbom = Directory.GetDirectories(_claimedFolderPath)
             .OrderBy(carpeta => Path.GetFileName(carpeta))
             .Select(carpeta => Directory.GetFiles(carpeta, "*.plmxml").FirstOrDefault())
             .Where(f => f != null)
             .Select(f => Path.GetFileName(f!))
             .ToList();
-
-        lblCola.Text = archivos.Count == 0
-            ? "(sin MBOM en cola)"
-            : string.Join(Environment.NewLine, archivos);
-
-        if (lblColaTitle != null)
-            lblColaTitle.Text = archivos.Count > 0
-                ? $"MBOM en cola  ({archivos.Count})"
-                : "MBOM en cola";
     }
 
     private void ActualizarProgresoBopFallbackPorCarpetas()
@@ -1315,19 +1487,58 @@ public partial class Form1 : Form
 
         _status.BopPendientes = pendCount;
         _status.BopProcesadas = procCount;
-
-        // Siempre usar carpetas como fuente de verdad para el progreso BOP:
-        // evita que el total del log quede inflado y nunca llegue al 100%
         _status.BopTotal = pendCount + procCount;
+
+        // Solo actualizar BopDone cuando el log confirmó que arrancó la fase BOP;
+        // no auto-activar _bopStageStarted desde carpetas para no romper el tracking de SG1 MBOM
         if (_bopStageStarted)
-            _status.BopDone = procCount;
+            _status.BopDone = Math.Max(procCount, _bopDoneFiles.Count);
     }
 
     // ==========================================================
     // 4) UI
     // ==========================================================
+    // Banner superior: conexión perdida, error de config o error inesperado del monitor.
+    // Se pinta aparte de PintarUI para poder mostrarse incluso si el resto de la lectura falló.
+    private void PintarBanner()
+    {
+        var lbl = Controls.Find("lblBanner", true).FirstOrDefault() as Label;
+        if (lbl == null) return;
+
+        bool sinConexionSostenida = !_servidorAlcanzable && _sinConexionDesde.HasValue
+            && (DateTime.Now - _sinConexionDesde.Value) >= UmbralAvisoSinConexion;
+
+        if (!string.IsNullOrEmpty(_monitorError))
+        {
+            lbl.Text = $"⚠ {_monitorError}";
+            lbl.BackColor = Color.FromArgb(200, 30, 30);
+            lbl.ForeColor = Color.White;
+            lbl.Visible = true;
+        }
+        else if (sinConexionSostenida)
+        {
+            lbl.Text = "⚠ Sin conexión con el servidor de red — verificá la conexión";
+            lbl.BackColor = Color.FromArgb(200, 30, 30);
+            lbl.ForeColor = Color.White;
+            lbl.Visible = true;
+        }
+        else if (!string.IsNullOrEmpty(_configLoadError))
+        {
+            lbl.Text = $"⚠ {_configLoadError}";
+            lbl.BackColor = Color.FromArgb(230, 160, 20);
+            lbl.ForeColor = Color.FromArgb(60, 40, 0);
+            lbl.Visible = true;
+        }
+        else
+        {
+            lbl.Visible = false;
+        }
+    }
+
     private void PintarUI()
     {
+        PintarBanner();
+
         var lblMbomProg = Controls.Find("lblMbomProg", true).FirstOrDefault() as Label;
         var lblMbomSub = Controls.Find("lblMbomSub", true).FirstOrDefault() as Label;
         var pbSb1 = Controls.Find("pbSb1", true).FirstOrDefault() as FlatProgressBar;
@@ -1391,6 +1602,40 @@ public partial class Form1 : Form
         if (lblMbomPath != null)
             lblMbomPath.Text = $"Ruta: {_status.MbomFolderPath ?? "-"}";
 
+        var lbCola = Controls.Find("lbCola", true).FirstOrDefault() as ListBox;
+        var lblColaTitle = Controls.Find("lblColaTitle", true).FirstOrDefault() as Label;
+        if (lbCola != null)
+        {
+            // Armar lista de display sin tocar el control si no cambió (preserva posición del scroll)
+            List<string> displayItems;
+            if (!Directory.Exists(_claimedFolderPath))
+                displayItems = new List<string> { "(carpeta no encontrada)" };
+            else if (_colaMbom.Count == 0)
+                displayItems = new List<string> { "(sin MBOM en cola)" };
+            else
+                displayItems = _colaMbom;
+
+            bool igual = lbCola.Items.Count == displayItems.Count
+                && Enumerable.Range(0, lbCola.Items.Count).All(i => lbCola.Items[i]?.ToString() == displayItems[i]);
+
+            if (!igual)
+            {
+                int topIdx = lbCola.TopIndex;
+                lbCola.BeginUpdate();
+                lbCola.Items.Clear();
+                foreach (var f in displayItems)
+                    lbCola.Items.Add(f);
+                lbCola.EndUpdate();
+                if (topIdx > 0 && topIdx < lbCola.Items.Count)
+                    lbCola.TopIndex = topIdx;
+            }
+
+            if (lblColaTitle != null)
+                lblColaTitle.Text = _colaMbom.Count > 0
+                    ? $"MBOM en cola  ({_colaMbom.Count})"
+                    : "MBOM en cola";
+        }
+
         if (lblSb1 != null)
         {
             lblSb1.Text = $"SB1: {_lastSb1Flow ?? "-"}";
@@ -1442,56 +1687,139 @@ public partial class Form1 : Form
         if (lblUpd != null)
             lblUpd.Text = $"Última actualización: {_status.LastLogUpdate:yyyy-MM-dd HH:mm:ss}";
 
+        // Exportando mientras haya BOPs en carpeta y el log del script todavía no exista
+        bool exportandoBops = _status.BopTotal > 0
+            && (string.IsNullOrWhiteSpace(_scriptPrincipalLogPath) || !File.Exists(_scriptPrincipalLogPath));
+
+        // Detectar el fin de la ráfaga de exportación para arrancar la ventana de gracia
+        if (_exportandoBopsAnterior && !exportandoBops)
+            _exportBopsFinalizadoEn = DateTime.Now;
+        _exportandoBopsAnterior = exportandoBops;
+
+        // Gris solo si exportando Y todavía no llegó ningún dato real; si ya hay 201s, mostrar estado real
+        var healthDisplay = (exportandoBops && _healthEstado == EstadoEndpoint.SinDatos) ? EstadoEndpoint.SinDatos : _healthEstado;
+
+        // Protheus: durante la exportación (y unos segundos después de que termine) los 500/timeout
+        // puntuales suelen ser transitorios y se resuelven con reintento; no mostrar "Inactivo" falso
+        // salvo que la caída persista más allá de la ventana de gracia post-exportación.
+        bool enGraciaPostExportacion = _exportBopsFinalizadoEn.HasValue
+            && (DateTime.Now - _exportBopsFinalizadoEn.Value) < GraciaPostExportacion;
+        var protheusDisplay = (_protheusEstado == EstadoEndpoint.Inactivo && (exportandoBops || enGraciaPostExportacion))
+            ? EstadoEndpoint.SinDatos
+            : _protheusEstado;
+
         var lblHealthStatus = Controls.Find("lblHealthStatus", true).FirstOrDefault() as Label;
         if (lblHealthStatus != null)
         {
-            lblHealthStatus.Text      = _healthActivo ? "● HEALTH: Activo" : "● HEALTH: Inactivo";
-            lblHealthStatus.BackColor = _healthActivo ? Color.LimeGreen : Color.Red;
-            lblHealthStatus.ForeColor = _healthActivo ? Color.DarkGreen : Color.White;
+            lblHealthStatus.Text = healthDisplay switch
+            {
+                EstadoEndpoint.Activo   => "● HEALTH: Activo",
+                EstadoEndpoint.Inactivo => "● HEALTH: Inactivo",
+                _                       => "● HEALTH: Sin datos"
+            };
+            lblHealthStatus.BackColor = healthDisplay switch
+            {
+                EstadoEndpoint.Activo   => Color.LimeGreen,
+                EstadoEndpoint.Inactivo => Color.Red,
+                _                       => Color.Silver
+            };
+            lblHealthStatus.ForeColor = healthDisplay switch
+            {
+                EstadoEndpoint.Activo   => Color.DarkGreen,
+                EstadoEndpoint.Inactivo => Color.White,
+                _                       => Color.FromArgb(70, 70, 70)
+            };
         }
 
         var lblProtheusStatus = Controls.Find("lblProtheusStatus", true).FirstOrDefault() as Label;
         if (lblProtheusStatus != null)
         {
-            lblProtheusStatus.Text      = _protheusActivo ? "● Endpoints: Activo" : "● Endpoints: Inactivo";
-            lblProtheusStatus.BackColor = _protheusActivo ? Color.LimeGreen : Color.Red;
-            lblProtheusStatus.ForeColor = _protheusActivo ? Color.DarkGreen : Color.White;
+            lblProtheusStatus.Text = protheusDisplay switch
+            {
+                EstadoEndpoint.Activo   => "● Endpoints: Activo",
+                EstadoEndpoint.Inactivo => "● Endpoints: Inactivo",
+                _                       => "● Endpoints: Sin datos"
+            };
+            lblProtheusStatus.BackColor = protheusDisplay switch
+            {
+                EstadoEndpoint.Activo   => Color.LimeGreen,
+                EstadoEndpoint.Inactivo => Color.Red,
+                _                       => Color.Silver
+            };
+            lblProtheusStatus.ForeColor = protheusDisplay switch
+            {
+                EstadoEndpoint.Activo   => Color.DarkGreen,
+                EstadoEndpoint.Inactivo => Color.White,
+                _                       => Color.FromArgb(70, 70, 70)
+            };
         }
 
-        // Downtime: caído hace X | Total sesión: Y  (siempre visible)
+        var lblBopExportando = Controls.Find("lblBopExportando", true).FirstOrDefault() as Label;
+        if (lblBopExportando != null)
+        {
+            lblBopExportando.Visible = exportandoBops;
+            if (exportandoBops)
+            {
+                lblBopExportando.Text      = $"⏳  Exportando BOPs... ({_status.BopDone}/{_status.BopTotal})";
+                lblBopExportando.BackColor = Color.FromArgb(255, 200, 80);
+                lblBopExportando.ForeColor = Color.FromArgb(100, 60, 0);
+            }
+        }
+
         var now = DateTime.Now;
 
         var lblHealthDowntime = Controls.Find("lblHealthDowntime", true).FirstOrDefault() as Label;
         if (lblHealthDowntime != null)
         {
-            var curDown   = _healthCaidoDesde.HasValue ? now - _healthCaidoDesde.Value : TimeSpan.Zero;
-            var totalDown = _healthTiempoTotal + curDown;
-            if (_healthCaidoDesde.HasValue)
+            if (exportandoBops && _healthEstado == EstadoEndpoint.SinDatos)
             {
-                lblHealthDowntime.Text      = $"HEALTH — Caído hace: {FmtDowntime(curDown)}  |  Total caído sesión: {FmtDowntime(totalDown)}";
-                lblHealthDowntime.ForeColor = Color.DarkRed;
+                lblHealthDowntime.Text      = "HEALTH — Sin datos (exportando BOPs)";
+                lblHealthDowntime.ForeColor = Color.DimGray;
             }
             else
             {
-                lblHealthDowntime.Text      = $"HEALTH — Total caído sesión: {FmtDowntime(totalDown)}";
-                lblHealthDowntime.ForeColor = totalDown.TotalSeconds >= 1 ? Color.DarkOrange : Color.DimGray;
+                var curDown   = _healthCaidoDesde.HasValue ? now - _healthCaidoDesde.Value : TimeSpan.Zero;
+                var totalDown = _healthTiempoTotal + curDown;
+                if (_healthCaidoDesde.HasValue)
+                {
+                    lblHealthDowntime.Text      = $"HEALTH — Caído hace: {FmtDowntime(curDown)}  |  Total caído sesión: {FmtDowntime(totalDown)}";
+                    lblHealthDowntime.ForeColor = Color.DarkRed;
+                }
+                else
+                {
+                    lblHealthDowntime.Text      = $"HEALTH — Total caído sesión: {FmtDowntime(totalDown)}";
+                    lblHealthDowntime.ForeColor = totalDown.TotalSeconds >= 1 ? Color.DarkOrange : Color.DimGray;
+                }
             }
         }
 
         var lblProtheusDowntime = Controls.Find("lblProtheusDowntime", true).FirstOrDefault() as Label;
         if (lblProtheusDowntime != null)
         {
-            var curDown   = _protheusCaidoDesde.HasValue ? now - _protheusCaidoDesde.Value : TimeSpan.Zero;
-            var totalDown = _protheusTiempoTotal + curDown;
-            if (_protheusCaidoDesde.HasValue)
+            if (protheusDisplay == EstadoEndpoint.SinDatos && _protheusEstado != EstadoEndpoint.SinDatos)
             {
-                lblProtheusDowntime.Text      = $"Endpoints — Caído hace: {FmtDowntime(curDown)}  |  Total caído sesión: {FmtDowntime(totalDown)}";
-                lblProtheusDowntime.ForeColor = Color.DarkRed;
+                lblProtheusDowntime.Text      = "Endpoints — Verificando (posible transitorio durante exportación de BOPs)";
+                lblProtheusDowntime.ForeColor = Color.DimGray;
+            }
+            else if (exportandoBops && _protheusEstado == EstadoEndpoint.SinDatos)
+            {
+                lblProtheusDowntime.Text      = "Endpoints — Sin datos (exportando BOPs)";
+                lblProtheusDowntime.ForeColor = Color.DimGray;
             }
             else
             {
-                lblProtheusDowntime.Text      = $"Endpoints — Total caído sesión: {FmtDowntime(totalDown)}";
-                lblProtheusDowntime.ForeColor = totalDown.TotalSeconds >= 1 ? Color.DarkOrange : Color.DimGray;
+                var curDown   = _protheusCaidoDesde.HasValue ? now - _protheusCaidoDesde.Value : TimeSpan.Zero;
+                var totalDown = _protheusTiempoTotal + curDown;
+                if (_protheusCaidoDesde.HasValue)
+                {
+                    lblProtheusDowntime.Text      = $"Endpoints — Caído hace: {FmtDowntime(curDown)}  |  Total caído sesión: {FmtDowntime(totalDown)}";
+                    lblProtheusDowntime.ForeColor = Color.DarkRed;
+                }
+                else
+                {
+                    lblProtheusDowntime.Text      = $"Endpoints — Total caído sesión: {FmtDowntime(totalDown)}";
+                    lblProtheusDowntime.ForeColor = totalDown.TotalSeconds >= 1 ? Color.DarkOrange : Color.DimGray;
+                }
             }
         }
     }
@@ -1516,6 +1844,37 @@ public partial class Form1 : Form
         if (ts.TotalHours >= 1)  return $"{(int)ts.TotalHours}h {ts.Minutes}m {ts.Seconds}s";
         if (ts.TotalMinutes >= 1) return $"{(int)ts.TotalMinutes}m {ts.Seconds}s";
         return $"{(int)ts.TotalSeconds}s";
+    }
+
+    // ==========================================================
+    // Log de caídas de HEALTH / Endpoints (Protheus)
+    // ==========================================================
+    private static void LogDowntimeEvento(string modulo, string evento)
+    {
+        try
+        {
+            var linea = $"{DateTime.Now:yyyy-MM-dd HH:mm:ss} - {modulo}: {evento}{Environment.NewLine}";
+            lock (DowntimeLogLock)
+                File.AppendAllText(DowntimeLogPath, linea);
+        }
+        catch
+        {
+            // no bloquear el monitor si no se puede escribir el log de downtime
+        }
+    }
+
+    private void MarcarHealthInactivo()
+    {
+        _healthEstado = EstadoEndpoint.Inactivo;
+        _healthCaidoDesde = DateTime.Now;
+        LogDowntimeEvento("HEALTH", "CAÍDO");
+    }
+
+    private void MarcarProtheusInactivo()
+    {
+        _protheusEstado = EstadoEndpoint.Inactivo;
+        _protheusCaidoDesde = DateTime.Now;
+        LogDowntimeEvento("Endpoints", "CAÍDO");
     }
 
     private static void SetProgress(FlatProgressBar? pb, int done, int total)
@@ -1586,6 +1945,13 @@ public enum Severity
     Ok = 0,
     Warning = 1,
     Error = 2
+}
+
+public enum EstadoEndpoint
+{
+    SinDatos = 0,
+    Activo   = 1,
+    Inactivo = 2
 }
 
 /// <summary>Barra de progreso plana y coloreada, dibujada a mano.</summary>
